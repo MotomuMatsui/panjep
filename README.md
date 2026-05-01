@@ -1,6 +1,6 @@
-# panjep
+# PANJEP: Pairwise Alignment-based Neighbor Joining with Edge Perturbation
 
-A fast, parallel Neighbour-Joining (NJ) phylogenetic tree builder written in C++17.
+A fast, parallel Neighbour-Joining (NJ) phylogenetic tree inference software written in C++17.
 
 `panjep` accepts either a PHYLIP distance matrix or a FASTA sequence file. For FASTA input it runs an all-vs-all homology search (MMseqs2 for protein, NCBI BLAST+ `blastn` for nucleotide), converts the per-pair alignments into evolutionary distances, builds an NJ tree, and optionally attaches bipartition support values via Edge Perturbation (EP). The format is auto-detected; a single binary handles every path.
 
@@ -94,3 +94,9 @@ Makefile
 ## License
 
 Released under the [GNU General Public License v3.0 or later](https://www.gnu.org/licenses/gpl-3.0.html). See the `LICENSE` file for the full text.
+
+## Reference
+Motomu Matsui and Wataru Iwasaki, Graph Splitting: A Graph-Based Approach for Superfamily-Scale Phylogenetic Tree Reconstruction, Systematic Biology, 2019    
+
+## Author
+[Motomu Matsui](https://sites.google.com/site/motomumatsui/)
