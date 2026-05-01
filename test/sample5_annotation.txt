@@ -1,0 +1,5 @@
+1	seq_a
+2	seq_b
+3	seq_c
+4	seq_d
+5	seq_e

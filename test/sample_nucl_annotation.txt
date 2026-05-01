@@ -1,0 +1,5 @@
+1	seq1
+2	seq2
+3	seq3
+4	seq4
+5	seq5
