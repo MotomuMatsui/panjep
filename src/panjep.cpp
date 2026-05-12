@@ -282,7 +282,16 @@ void NJSolver::do_merge(int i, int j) {
     const bool par = (n_active_ >= 256);
     if (par) {
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) reduction(+:R_k)
+        // Per-iteration work is small (a handful of cache lines), so the
+        // parallel scan saturates the memory hierarchy well before the
+        // user's full thread count — on EPYC 9534, -t 64 is ~50% slower
+        // than -t 32 at n=8000 because the team oversubscribes the cache.
+        // Cap at 32 (empirical, may need re-tuning on >64-core platforms);
+        // still bounded above by omp_get_max_threads / -t setting.
+        constexpr int kMaxMergeThreads = 32;
+        const int nthreads = std::min(omp_get_max_threads(), kMaxMergeThreads);
+        #pragma omp parallel for schedule(static) reduction(+:R_k) \
+                                                  num_threads(nthreads)
 #endif
         for (int m = 0; m < max_nodes_; m++) {
             if (!active_[m] || m == i || m == j) continue;
