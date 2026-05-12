@@ -24,12 +24,20 @@
 #  include <omp.h>
 #endif
 
-// ARM NEON – available on Apple Silicon and any ARMv7/AArch64 with NEON.
-// The compiler uses NEON automatically with -march=native; we add explicit
-// intrinsics only for the hot inner loop where the branch on active_[j] would
-// otherwise block auto-vectorisation.
-#if defined(__ARM_NEON)
+// Explicit SIMD intrinsics for the hot find_min_q inner loop.  The
+// running-min-with-index pattern (track both Q and the j that produced it)
+// has a conditional update that defeats auto-vectorisation on most
+// compilers, so we hand-write each ISA path.  Dispatch in priority order:
+// AVX-512 (16 lanes) → AVX2 (8 lanes) → NEON (4 lanes) → scalar fallback.
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+#  include <immintrin.h>
+#  define PJ_SIMD_AVX512 1
+#elif defined(__AVX2__)
+#  include <immintrin.h>
+#  define PJ_SIMD_AVX2 1
+#elif defined(__ARM_NEON)
 #  include <arm_neon.h>
+#  define PJ_SIMD_NEON 1
 #endif
 
 namespace panjep {
@@ -139,7 +147,66 @@ std::pair<int,int> NJSolver::find_min_q() const {
         const float* Rm  = R_masked_.data();
         int j = 0;
 
-#if defined(__ARM_NEON)
+#if defined(PJ_SIMD_AVX512)
+        // ---- AVX-512 inner loop: 16 pairs per iteration ----
+        __m512        q_best = _mm512_set1_ps(l_Q);
+        __m512i       j_best = _mm512_set1_epi32(-1);
+        const __m512i j_step = _mm512_set1_epi32(16);
+        const __m512  n2_v   = _mm512_set1_ps(n2f);
+        const __m512  Ri_v   = _mm512_set1_ps(Rif);
+        __m512i       j_cur  = _mm512_setr_epi32(0,1,2,3,4,5,6,7,
+                                                 8,9,10,11,12,13,14,15);
+        for (; j + 15 < i; j += 16) {
+            __m512 d_v  = _mm512_loadu_ps(row + j);
+            __m512 rm_v = _mm512_loadu_ps(Rm  + j);
+            // Q = n2 * d - Ri - Rm[j]   (Rm[j]=−1e30 for inactive → Q≈+∞)
+            __m512 q_v  = _mm512_sub_ps(
+                              _mm512_sub_ps(_mm512_mul_ps(d_v, n2_v), Ri_v),
+                              rm_v);
+            __mmask16 lt = _mm512_cmp_ps_mask(q_v, q_best, _CMP_LT_OS);
+            q_best = _mm512_mask_blend_ps   (lt, q_best, q_v);
+            j_best = _mm512_mask_blend_epi32(lt, j_best, j_cur);
+            j_cur  = _mm512_add_epi32(j_cur, j_step);
+        }
+        float   q_arr[16]; _mm512_storeu_ps(q_arr, q_best);
+        int32_t j_arr[16]; _mm512_storeu_si512((__m512i*)j_arr, j_best);
+        for (int k = 0; k < 16; k++) {
+            int jj = j_arr[k];
+            if (jj >= 0 && active_[jj] && q_arr[k] < l_Q) {
+                l_Q = q_arr[k];  g_i = i;  g_j = jj;
+            }
+        }
+#elif defined(PJ_SIMD_AVX2)
+        // ---- AVX2 inner loop: 8 pairs per iteration ----
+        __m256        q_best = _mm256_set1_ps(l_Q);
+        __m256i       j_best = _mm256_set1_epi32(-1);
+        const __m256i j_step = _mm256_set1_epi32(8);
+        const __m256  n2_v   = _mm256_set1_ps(n2f);
+        const __m256  Ri_v   = _mm256_set1_ps(Rif);
+        __m256i       j_cur  = _mm256_setr_epi32(0,1,2,3,4,5,6,7);
+        for (; j + 7 < i; j += 8) {
+            __m256 d_v  = _mm256_loadu_ps(row + j);
+            __m256 rm_v = _mm256_loadu_ps(Rm  + j);
+            __m256 q_v  = _mm256_sub_ps(
+                              _mm256_sub_ps(_mm256_mul_ps(d_v, n2_v), Ri_v),
+                              rm_v);
+            // cmp returns all-ones lanes where q_v < q_best; blendv keys on
+            // the sign bit, so the same mask drives both float and int blends.
+            __m256  lt   = _mm256_cmp_ps(q_v, q_best, _CMP_LT_OS);
+            __m256i lt_i = _mm256_castps_si256(lt);
+            q_best = _mm256_blendv_ps  (q_best, q_v,   lt);
+            j_best = _mm256_blendv_epi8(j_best, j_cur, lt_i);
+            j_cur  = _mm256_add_epi32(j_cur, j_step);
+        }
+        float   q_arr[8]; _mm256_storeu_ps(q_arr, q_best);
+        int32_t j_arr[8]; _mm256_storeu_si256((__m256i*)j_arr, j_best);
+        for (int k = 0; k < 8; k++) {
+            int jj = j_arr[k];
+            if (jj >= 0 && active_[jj] && q_arr[k] < l_Q) {
+                l_Q = q_arr[k];  g_i = i;  g_j = jj;
+            }
+        }
+#elif defined(PJ_SIMD_NEON)
         // ---- NEON inner loop: 4 pairs per iteration ----
         float32x4_t q_best = vdupq_n_f32(l_Q);
         int32x4_t   j_best = vdupq_n_s32(-1);
@@ -172,7 +239,7 @@ std::pair<int,int> NJSolver::find_min_q() const {
             }
         }
 #endif
-        // ---- Scalar tail (also the full inner loop on non-NEON) ----
+        // ---- Scalar tail (also the full inner loop on no-SIMD targets) ----
         for (; j < i; j++) {
             // R_masked_ makes this branch-free: inactive j → very large Q.
             float Q = n2f * row[j] - Rif - Rm[j];
