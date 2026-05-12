@@ -7,7 +7,7 @@ A fast, parallel Neighbour-Joining (NJ) phylogenetic tree inference software wri
 ## Features
 
 - **Single binary, two inputs.** PHYLIP distance matrix or FASTA — auto-detected from the first character.
-- **Parallel NJ core.** OpenMP-parallel `Q`-matrix scan with an ARM NEON inner loop and a row-level lower-bound that skips whole rows.
+- **Parallel NJ core.** ARM-NEON inner loop with a row-level lower-bound that skips whole rows; merge step is OpenMP-parallel. (The Q-min scan itself is serial — on a 64-core box it's memory-bound and beats parallel by a wide margin.)
 - **Lower-triangular `float` storage.** Minimal memory footprint; matrix is sized for `2n−1` nodes upfront and never resizes.
 - **FASTA pipeline.** Auto-selects MMseqs2 (protein) or `blastn` (nucleotide) by alphabet detection. Tools are invoked via `fork`+`execvp` (no shell), so input filenames are injection-safe.
 - **Many distance methods.** ScoreDist (BLOSUM62), Poisson, p-distance, JC69, K2P, F81, F84, TN93, log-det, RY (transversion-only).
@@ -69,7 +69,7 @@ For FASTA input, `panjep` runs the following pipeline:
    - Protein: `mmseqs search ... -a 1` then `mmseqs convertalis ... --format-output query,target,qaln,taln,bits`.
    - Nucleotide: `blastn -outfmt "6 qseqid sseqid qseq sseq bitscore"`. Sensitivity `-s` maps to `-task` (megablast → blastn-short).
 3. **Pairwise distances** from the aligned sequences (OpenMP-parallel). When both directions `i→j` and `j→i` have hits, distances are averaged; missing pairs collapse to a saturation cap of 5.0.
-4. **Neighbour-Joining.** `O(n³)` core with vectorised `Q`-min scan; `do_merge` switches between serial and parallel reductions at `n_active ≥ 256`.
+4. **Neighbour-Joining.** `O(n³)` core. `find_min_q` is a serial NEON-vectorised lower-triangle scan with a row-level lower-bound; `do_merge` switches between serial and parallel reductions at `n_active ≥ 256`.
 5. **EP support (optional).** Each iteration converts `d → exp(−d)`, applies a GEV perturbation, maps back via `−log(·)`, and re-runs NJ. Bipartition frequencies (canonicalised on the side containing leaf 0) become support values.
 
 ### Distance kernels

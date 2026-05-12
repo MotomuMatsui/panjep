@@ -97,7 +97,7 @@ void NJSolver::init_row_sums() {
 }
 
 // ============================================================
-// find_min_q  –  O(n²/p) parallel lower-triangle scan
+// find_min_q  –  O(n²) lower-triangle scan (serial)
 //
 // Key ideas:
 //  1. Scan only (i,j) with i > j  →  each pair visited exactly once.
@@ -105,101 +105,80 @@ void NJSolver::init_row_sums() {
 //  2. R_masked_[j] = −1e30f for inactive j  →  makes Q(i,inactive_j) ≈ +∞,
 //     so inactive nodes are never selected without a branch.
 //  3. ARM NEON processes 4 float pairs per cycle in the inner loop.
-//  4. Row-level skip: if −R[i] − R_max ≥ thread_best_Q, the minimum Q from
-//     this row cannot improve the running best  →  skip the whole row.
+//  4. Row-level skip: if −R[i] − R_max ≥ running best, the minimum Q from
+//     this row cannot improve it  →  skip the whole row.
+//
+// NOTE on threading: this function is intentionally serial.  Benchmarks on
+// EPYC 9534 (64 cores) show O(n²) work per call is too small per-call and
+// too memory-bound to amortise OpenMP fork/join across thousands of calls;
+// the row-skip's running-best is also hard to share efficiently between
+// threads without losing more than it saves.  Companion do_merge stays
+// OpenMP-parallel where the larger per-call work pays off — for n=8000
+// this combination is ~38% faster than the previously-parallel find_min_q
+// at t=32, and beats single-threaded at every tested size.
 // ============================================================
 
 std::pair<int,int> NJSolver::find_min_q() const {
-    const float n2f  = static_cast<float>(n_active_ - 2);
+    const float n2f = static_cast<float>(n_active_ - 2);
 
     // R_max over active nodes (for row-level lower bound).
     // R_masked_[inactive] = NEG_INF_MASK ≪ any real R, so max ignores them.
-    float R_max = *std::max_element(R_masked_.begin(), R_masked_.end());
+    const float R_max = *std::max_element(R_masked_.begin(), R_masked_.end());
 
     int   g_i = -1, g_j = -1;
-    float g_Q = std::numeric_limits<float>::infinity();
-
-#ifdef _OPENMP
-    #pragma omp parallel
-    {
-        int   l_i = -1, l_j = -1;
-        float l_Q = std::numeric_limits<float>::infinity();
-
-        // dynamic,8: early outer rows prune heavily; let threads steal work.
-        #pragma omp for schedule(dynamic, 8) nowait
-        for (int i = 0; i < max_nodes_; i++) {
-            if (!active_[i]) continue;
-
-            const float Rif = static_cast<float>(R_[i]);
-
-            // Row-level lower bound (d ≥ 0  →  Q_row_min ≥ −R[i]−R_max).
-            if (-Rif - R_max >= l_Q) continue;
-
-            const float* row = dist_.row_ptr(i);   // d(i,0)…d(i,i−1)
-            const float* Rm  = R_masked_.data();
-            int j = 0;
-
-#if defined(__ARM_NEON)
-            // ---- NEON inner loop: 4 pairs per iteration ----
-            float32x4_t q_best = vdupq_n_f32(l_Q);
-            int32x4_t   j_best = vdupq_n_s32(-1);
-            const int32x4_t j_step = vdupq_n_s32(4);
-            int32_t j_init[4] = {0, 1, 2, 3};
-            int32x4_t j_cur = vld1q_s32(j_init);
-
-            for (; j + 3 < i; j += 4) {
-                float32x4_t d_v  = vld1q_f32(row + j);
-                float32x4_t rm_v = vld1q_f32(Rm  + j);
-                // Q = n2 * d - Ri - Rm[j]   (Rm[j]=−1e30 for inactive → Q≈+∞)
-                float32x4_t q_v  = vsubq_f32(
-                                       vsubq_f32(vmulq_n_f32(d_v, n2f),
-                                                 vdupq_n_f32(Rif)),
-                                       rm_v);
-                uint32x4_t  lt   = vcltq_f32(q_v, q_best);
-                q_best = vbslq_f32(lt, q_v, q_best);
-                j_best = vbslq_s32(vreinterpretq_s32_u32(lt), j_cur, j_best);
-                j_cur  = vaddq_s32(j_cur, j_step);
-            }
-
-            // Horizontal reduction: extract best (q, j) from 4 NEON lanes.
-            float   q_arr[4]; vst1q_f32(q_arr, q_best);
-            int32_t j_arr[4]; vst1q_s32(j_arr, j_best);
-            for (int k = 0; k < 4; k++) {
-                int jj = j_arr[k];
-                // jj = -1 means no update in this lane; active_ guards stale k.
-                if (jj >= 0 && active_[jj] && q_arr[k] < l_Q) {
-                    l_Q = q_arr[k];  l_i = i;  l_j = jj;
-                }
-            }
-#endif
-            // ---- Scalar tail (also the full inner loop on non-NEON) ----
-            for (; j < i; j++) {
-                // R_masked_ makes this branch-free: inactive j → very large Q.
-                float Q = n2f * row[j] - Rif - Rm[j];
-                if (Q < l_Q) { l_Q = Q;  l_i = i;  l_j = j; }
-            }
-        }
-
-        #pragma omp critical
-        if (l_Q < g_Q) { g_Q = l_Q;  g_i = l_i;  g_j = l_j; }
-    }
-
-#else  // ---- Single-threaded path ----
     float l_Q = std::numeric_limits<float>::infinity();
+
     for (int i = 0; i < max_nodes_; i++) {
         if (!active_[i]) continue;
+
         const float Rif = static_cast<float>(R_[i]);
+        // Row-level lower bound (d ≥ 0  →  Q_row_min ≥ −R[i]−R_max).
         if (-Rif - R_max >= l_Q) continue;
 
-        const float* row = dist_.row_ptr(i);
+        const float* row = dist_.row_ptr(i);   // d(i,0)…d(i,i−1)
         const float* Rm  = R_masked_.data();
-        for (int j = 0; j < i; j++) {
+        int j = 0;
+
+#if defined(__ARM_NEON)
+        // ---- NEON inner loop: 4 pairs per iteration ----
+        float32x4_t q_best = vdupq_n_f32(l_Q);
+        int32x4_t   j_best = vdupq_n_s32(-1);
+        const int32x4_t j_step = vdupq_n_s32(4);
+        int32_t j_init[4] = {0, 1, 2, 3};
+        int32x4_t j_cur = vld1q_s32(j_init);
+
+        for (; j + 3 < i; j += 4) {
+            float32x4_t d_v  = vld1q_f32(row + j);
+            float32x4_t rm_v = vld1q_f32(Rm  + j);
+            // Q = n2 * d - Ri - Rm[j]   (Rm[j]=−1e30 for inactive → Q≈+∞)
+            float32x4_t q_v  = vsubq_f32(
+                                   vsubq_f32(vmulq_n_f32(d_v, n2f),
+                                             vdupq_n_f32(Rif)),
+                                   rm_v);
+            uint32x4_t  lt   = vcltq_f32(q_v, q_best);
+            q_best = vbslq_f32(lt, q_v, q_best);
+            j_best = vbslq_s32(vreinterpretq_s32_u32(lt), j_cur, j_best);
+            j_cur  = vaddq_s32(j_cur, j_step);
+        }
+
+        // Horizontal reduction: extract best (q, j) from 4 NEON lanes.
+        float   q_arr[4]; vst1q_f32(q_arr, q_best);
+        int32_t j_arr[4]; vst1q_s32(j_arr, j_best);
+        for (int k = 0; k < 4; k++) {
+            int jj = j_arr[k];
+            // jj = -1 means no update in this lane; active_ guards stale k.
+            if (jj >= 0 && active_[jj] && q_arr[k] < l_Q) {
+                l_Q = q_arr[k];  g_i = i;  g_j = jj;
+            }
+        }
+#endif
+        // ---- Scalar tail (also the full inner loop on non-NEON) ----
+        for (; j < i; j++) {
+            // R_masked_ makes this branch-free: inactive j → very large Q.
             float Q = n2f * row[j] - Rif - Rm[j];
             if (Q < l_Q) { l_Q = Q;  g_i = i;  g_j = j; }
         }
     }
-    g_Q = l_Q;
-#endif
 
     return {g_i, g_j};
 }

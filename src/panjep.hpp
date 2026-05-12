@@ -74,19 +74,21 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// NJSolver  –  Neighbour Joining with parallel O(n²/p) search + ARM NEON SIMD
+// NJSolver  –  Neighbour Joining with serial O(n²) search + ARM NEON SIMD
+//              and OpenMP-parallel merge
 //
 // Algorithm: Saitou & Nei (1987) / Studier & Keppler (1988)
 //
 // Optimisations:
 //   • No sorted-row maintenance: do_merge is O(n) per merge, not O(n²)
-//   • OpenMP over outer i-loop of find_min_q (lower-triangle, each pair once)
 //   • ARM NEON: process 4 float comparisons per cycle in the inner j-loop
 //   • R-masked sentinel (-∞) allows branch-free inactive-node masking in SIMD
-//   • Row-level lower-bound check: skip row i when −R[i]−R_max ≥ thread best
+//   • Row-level lower-bound check: skip row i when −R[i]−R_max ≥ running best
+//   • find_min_q is serial — per-call work is too small / memory-bound to
+//     amortise OpenMP fork/join across n calls on high-core machines
 //   • Parallel do_merge with OpenMP reduction for the new row-sum
 //
-// Complexity: O(n² log n) init, O(n³/p) search, O(n²) merge  →  O(n³/p) total
+// Complexity: O(n² log n) init, O(n³) search, O(n²/p) merge  →  O(n³) total
 // Memory:     O(n²) for the distance matrix + O(n) bookkeeping
 // ---------------------------------------------------------------------------
 class NJSolver {
