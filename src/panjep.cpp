@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -50,7 +51,9 @@ static constexpr float kInactiveR = -1e30f;
 
 DistMatrix::DistMatrix(int n)
     : n_(n),
-      data_(static_cast<std::size_t>(n) * (n - 1) / 2, 0.0f)
+      // new float[N] is default-initialised (i.e. uninitialised) for floats.
+      // See header for the read-after-write argument that keeps this safe.
+      data_(new float[static_cast<std::size_t>(n) * (n - 1) / 2])
 {}
 
 float& DistMatrix::at(int i, int j) noexcept { return data_[tri_idx(i, j)]; }
@@ -610,19 +613,88 @@ NJSolver NJSolver::from_phylip(const std::string& path) {
 
     NJSolver solver(n);
 
-    // Sequential pass: parse taxon names and record per-row float start pointers.
-    std::vector<const char*> float_start(n);
-    for (int i = 0; i < n; i++) {
-        while (*p == '\n' || *p == '\r') ++p;               // skip blank lines
-        const char* t = p;
-        while (*t && *t != ' ' && *t != '\t' && *t != '\n' && *t != '\r') ++t;
-        solver.set_name(i, std::string(p, t));
-        while (*t == ' ' || *t == '\t') ++t;
-        float_start[i] = t;
-        p = t;
-        while (*p && *p != '\n') ++p;
-        if (*p == '\n') ++p;
+    // ── Locate row boundaries in parallel ─────────────────────────────────
+    // The naive sequential newline scan ran at single-thread memory bandwidth
+    // (~1 GB/s effective, 287 ms for a 253 MB file at n=8000).  Split the
+    // post-header region into chunks, find each chunk's newlines via memchr
+    // (libc SIMD), then merge — saturates memory bandwidth across cores.
+    const char* const buf_end = buf.data() + nr;
+    std::vector<const char*> row_nl(n, nullptr);  // newline ending row i
+    {
+        const char* const data_start = p;
+        const std::size_t data_len   = static_cast<std::size_t>(buf_end - data_start);
+        int kChunks = 1;
+#ifdef _OPENMP
+        kChunks = std::min(omp_get_max_threads(), 64);
+#endif
+        std::vector<std::vector<const char*>> chunk_nls(kChunks);
+
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int c = 0; c < kChunks; c++) {
+            const std::size_t lo = (data_len * c)        / kChunks;
+            const std::size_t hi = (data_len * (c + 1))  / kChunks;
+            const char* cur = data_start + lo;
+            const char* end = data_start + hi;
+            auto& nls = chunk_nls[c];
+            nls.reserve((hi - lo) / 32 + 4);   // ~32 bytes per row is typical
+            while (cur < end) {
+                const char* nl = static_cast<const char*>(
+                    std::memchr(cur, '\n', static_cast<std::size_t>(end - cur)));
+                if (!nl) break;
+                nls.push_back(nl);
+                cur = nl + 1;
+            }
+        }
+
+        // Merge in chunk order; result is ascending because chunks are
+        // non-overlapping and contiguous.
+        std::size_t total = 0;
+        for (auto& v : chunk_nls) total += v.size();
+        if (static_cast<int>(total) < n)
+            throw std::runtime_error("PHYLIP: fewer rows than header declared");
+
+        // The first n newlines after the header demarcate the n data rows.
+        // Anything beyond is trailing whitespace.
+        int filled = 0;
+        for (auto& v : chunk_nls) {
+            for (const char* nl : v) {
+                if (filled == n) break;
+                row_nl[filled++] = nl;
+            }
+            if (filled == n) break;
+        }
+        if (filled < n)
+            throw std::runtime_error("PHYLIP: truncated data section");
     }
+
+    // ── Parallel name extraction ──────────────────────────────────────────
+    // With row_nl[i] known, each row is fully independent.
+    std::vector<const char*> float_start(n);
+    std::vector<std::string> names(n);
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int i = 0; i < n; i++) {
+        const char* row_start = (i == 0) ? p : row_nl[i - 1] + 1;
+        const char* row_end   = row_nl[i];
+        // Skip leading whitespace (incl. \r for CRLF files).
+        while (row_start < row_end &&
+               (*row_start == ' ' || *row_start == '\t' || *row_start == '\r'))
+            ++row_start;
+        // Name = first whitespace-delimited token.
+        const char* t = row_start;
+        while (t < row_end && *t != ' ' && *t != '\t') ++t;
+        names[i] = std::string(row_start, t);
+        // Skip whitespace between name and first float.
+        while (t < row_end && (*t == ' ' || *t == '\t')) ++t;
+        float_start[i] = t;
+    }
+    for (int i = 0; i < n; i++) solver.set_name(i, std::move(names[i]));
+#ifdef PHYLIP_PROFILE
+    auto t2 = Clk::now();
+#endif
 
     // Detect format: lower-triangular (row 0 carries 0 floats) vs full matrix.
     int row0_floats = 0;

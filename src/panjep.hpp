@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <iosfwd>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -45,6 +46,14 @@ enum class DistMethod {
 // DistMatrix
 // Lower-triangular distance matrix: element (i,j), i>j, at i*(i-1)/2 + j.
 // Float precision to halve memory and improve cache utilisation.
+//
+// Storage is UNINITIALISED at construction.  Every cell that NJSolver ever
+// reads has been written first — leaf cells by set_distance() during input
+// parsing, internal-node cells by do_merge().  Cells corresponding to pairs
+// where one side is already inactive are never written, but their values
+// are masked away in find_min_q by R_masked_[inactive] = -1e30 making Q ≈ +∞
+// regardless of the cell content.  Skipping the zero-init avoids a 512 MB
+// fault-in pass for n=8000 (≈220 ms on EPYC 9534).
 // ---------------------------------------------------------------------------
 class DistMatrix {
 public:
@@ -56,12 +65,12 @@ public:
     float  get(int i, int j) const noexcept;
 
     // Pointer to the contiguous block d(i,0)…d(i,i−1) in the lower triangle.
-    const float* row_ptr(int i) const noexcept { return data_.data() + lo_idx(i); }
-    float*       row_ptr(int i) noexcept       { return data_.data() + lo_idx(i); }
+    const float* row_ptr(int i) const noexcept { return data_.get() + lo_idx(i); }
+    float*       row_ptr(int i) noexcept       { return data_.get() + lo_idx(i); }
 
 private:
     int n_;
-    std::vector<float> data_;   // size n*(n-1)/2
+    std::unique_ptr<float[]> data_;   // size n*(n-1)/2, uninitialised
 
     static std::size_t tri_idx(int i, int j) noexcept {
         if (i < j) { int t = i; i = j; j = t; }
