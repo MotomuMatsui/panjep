@@ -7,10 +7,10 @@ A fast, parallel Neighbour-Joining (NJ) phylogenetic tree inference software wri
 ## Features
 
 - **Single binary, two inputs.** PHYLIP distance matrix or FASTA — auto-detected from the first character.
-- **Parallel NJ core.** ARM-NEON inner loop with a row-level lower-bound that skips whole rows; merge step is OpenMP-parallel. (The Q-min scan itself is serial — on a 64-core box it's memory-bound and beats parallel by a wide margin.)
-- **Lower-triangular `float` storage.** Minimal memory footprint; matrix is sized for `2n−1` nodes upfront and never resizes.
+- **Parallel NJ core.** SIMD inner loop (AVX-512 → AVX2 → NEON → scalar, picked at compile time) with a row-level lower-bound that skips whole rows; merge step is OpenMP-parallel and capped at 32 threads (above that the reduction starts losing to fork/join overhead). The Q-min scan itself is serial — on a 64-core box it's memory-bound and beats parallel by a wide margin.
+- **Lower-triangular `float` storage.** Minimal memory footprint; matrix is sized for `2n−1` nodes upfront and never resizes. Storage is left uninitialised — every read is preceded by a write, so the 512 MB zero-fill at n=8000 (~220 ms on EPYC 9534) is avoided.
 - **FASTA pipeline.** Auto-selects MMseqs2 (protein) or `blastn` (nucleotide) by alphabet detection. Tools are invoked via `fork`+`execvp` (no shell), so input filenames are injection-safe.
-- **Many distance methods.** ScoreDist (BLOSUM62), Poisson, p-distance, JC69, K2P, F81, F84, TN93, log-det, RY (transversion-only).
+- **Many distance methods.** ScoreDist (BLOSUM62), Poisson, p-distance, JC69, K2P, F81, F84, TN93, log-det, RY (transversion-only), and the full set of empirical AA models from FastME 2.1.6.4 (LG, WAG, JTT, Dayhoff, DCMut, MtREV, RtREV, CpREV, VT, HIVb, HIVw, FLU) — ML branch length per pair via Brent over a precomputed eigendecomposition of Q.
 - **EP branch support.** GEV-perturbed distances over `n` iterations; bipartition frequencies are written into the Newick output.
 
 ## Build
@@ -40,7 +40,11 @@ panjep [options] <input>
   -t N        OpenMP threads (default: all available)
   -s S        Search sensitivity 1.0–7.5 (FASTA only)
   -d METHOD   Distance method: scoredist | poisson | pdist | jc69 | k2p
-              | f81 | f84 | tn93 | logdet | ry | rysym | auto  (default: auto)
+              | f81 | f84 | tn93 | logdet | ry | rysym
+              | lg | wag | jtt | dayhoff | dcmut | mtrev | rtrev | cprev
+              | vt | hivb | hivw | flu | auto       (default: auto)
+  -p MODEL    FastME -p alias for protein models (single-letter and full
+              forms accepted, e.g. -p LG, -p L, -p WAG, -p HIVB, -p F81).
   -e N        EP iterations for branch support (default: 100; 0 disables)
   -v          Print timing / statistics to stderr
   -h          Show help
@@ -62,6 +66,8 @@ Output: Newick tree on stdout.
 
 ## How it works
 
+PHYLIP input is bulk-read into memory, then row boundaries are located in parallel (chunked `memchr` scan saturates memory bandwidth across cores), names and floats are parsed in parallel, and both lower-triangular and full-matrix formats are supported.
+
 For FASTA input, `panjep` runs the following pipeline:
 
 1. **Parse FASTA** and detect protein vs nucleotide by sampling up to 50 kB and checking whether ≥90% of characters lie in the nucleotide alphabet.
@@ -69,7 +75,7 @@ For FASTA input, `panjep` runs the following pipeline:
    - Protein: `mmseqs search ... -a 1` then `mmseqs convertalis ... --format-output query,target,qaln,taln,bits`.
    - Nucleotide: `blastn -outfmt "6 qseqid sseqid qseq sseq bitscore"`. Sensitivity `-s` maps to `-task` (megablast → blastn-short).
 3. **Pairwise distances** from the aligned sequences (OpenMP-parallel). When both directions `i→j` and `j→i` have hits, distances are averaged; missing pairs collapse to a saturation cap of 5.0.
-4. **Neighbour-Joining.** `O(n³)` core. `find_min_q` is a serial NEON-vectorised lower-triangle scan with a row-level lower-bound; `do_merge` switches between serial and parallel reductions at `n_active ≥ 256`.
+4. **Neighbour-Joining.** `O(n³)` core. `find_min_q` is a serial SIMD-vectorised lower-triangle scan (AVX-512 16-lane → AVX2 8-lane → NEON 4-lane → scalar, selected at compile time) with a row-level lower-bound; `do_merge` switches between serial and parallel reductions at `n_active ≥ 256` and caps the OpenMP team at 32 threads.
 5. **EP support (optional).** Each iteration converts `d → exp(−d)`, applies a GEV perturbation, maps back via `−log(·)`, and re-runs NJ. Bipartition frequencies (canonicalised on the side containing leaf 0) become support values.
 
 ### Distance kernels
@@ -77,6 +83,7 @@ For FASTA input, `panjep` runs the following pipeline:
 - **ScoreDist** (Sonnhammer & Hollich, 2005). BLOSUM62 with `scR = −0.5209·len`; positions with gap/X/ambiguous chars are skipped.
 - **Poisson correction.** `d = −((nc−1)/nc) · log(1 − s · nc/(nc−1))`, with `nc = 20` for protein and `nc = 4` for nucleotide; saturated pairs return the cap.
 - **DNA-specific.** JC69, K2P, F81, F84, TN93, log-det, RY/RYsym.
+- **Empirical AA models.** LG, WAG, JTT, Dayhoff, DCMut, MtREV, RtREV, CpREV, VT, HIVb, HIVw, FLU — same Q matrices and π vectors as FastME 2.1.6.4 (`p_models.c`). Q is built as `R · diag(π)/100`, scaled to mean rate 1, then eigendecomposed once via Jacobi on the symmetric form `D^{½}·Q·D^{−½}`. Per pair, a 20×20 column-count matrix `F` is filled from the alignment, normalised, and the ML branch length is found with Brent on −Σ F · log(π·P(t)) — equivalent to FastME's `Dist_F_Brent` + `Lk_Dist`.
 
 ## Repository layout
 

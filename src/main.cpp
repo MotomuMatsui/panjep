@@ -1,5 +1,7 @@
 #include "panjep.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -36,8 +38,14 @@ static void usage(const char* prog) {
         << "                logdet     log-det / paralinear (DNA)\n"
         << "                ry         transversion-only with empirical pi (DNA)\n"
         << "                rysym      transversion-only symmetric (DNA)\n"
+        << "                lg|wag|jtt|dayhoff|dcmut|mtrev|rtrev|cprev|vt|\n"
+        << "                hivb|hivw|flu   empirical AA models (ML branch length\n"
+        << "                           under Q matrix; protein-only)\n"
         << "                auto       ScoreDist for protein, Poisson(nc=4) for\n"
         << "                           nucleotide [default]\n"
+        << "  -p MODEL    FastME-style alias for protein models.  Accepts the\n"
+        << "              same single-letter and full-name shortcuts as fastme -p\n"
+        << "              (e.g. -p LG, -p L, -p WAG, -p HIVB, -p F81, -p P-DIST).\n"
         << "  -e N        EP iterations for branch support (default: 100, FASTA only;\n"
         << "              set 0 to disable EP)\n"
         << "  -v          Print timing / statistics to stderr\n"
@@ -46,6 +54,56 @@ static void usage(const char* prog) {
         << "Output: Newick tree on stdout.\n"
         << "        For FASTA input, internal node support values (0.00–1.00)\n"
         << "        are appended after each ')' using the EP method.\n";
+}
+
+// Parse a fastme -p style protein model token.  Accepts the same set as
+// fastme's testP / getModel_PROTEIN (interface_utilities.c), case-insensitive,
+// including the one-letter shortcuts:
+//   B → HIVB, C → CPREV, D → DCMUT, F → F81LIKE, H → DAYHOFF, I → HIVW,
+//   J → JTT,  L → LG,    M → MTREV, P → PDIST,   R → RTREV,   U → FLU,
+//   V → VT,   W → WAG
+// plus full names (LG / VT / JTT / WAG / FLU / F81 / F81LIKE / F81-LIKE /
+// HIVB / HIVW / CPREV / DCMUT / MTREV / RTREV / PDIST / P-DIST / DAYHOFF).
+// Returns true with *out set on success; false on unknown token.
+static bool parse_protein_model(const std::string& in, panjep::DistMethod& out) {
+    std::string s = in;
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+
+    if (s.size() == 1) {
+        switch (s[0]) {
+            case 'B': out = panjep::DistMethod::HIVb;    return true;
+            case 'C': out = panjep::DistMethod::CpREV;   return true;
+            case 'D': out = panjep::DistMethod::DCMut;   return true;
+            case 'F': out = panjep::DistMethod::F81;     return true;
+            case 'H': out = panjep::DistMethod::Dayhoff; return true;
+            case 'I': out = panjep::DistMethod::HIVw;    return true;
+            case 'J': out = panjep::DistMethod::JTT;     return true;
+            case 'L': out = panjep::DistMethod::LG;      return true;
+            case 'M': out = panjep::DistMethod::MtREV;   return true;
+            case 'P': out = panjep::DistMethod::PDist;   return true;
+            case 'R': out = panjep::DistMethod::RtREV;   return true;
+            case 'U': out = panjep::DistMethod::FLU;     return true;
+            case 'V': out = panjep::DistMethod::VT;      return true;
+            case 'W': out = panjep::DistMethod::WAG;     return true;
+            default:  return false;
+        }
+    }
+    if (s == "LG")                                        { out = panjep::DistMethod::LG;      return true; }
+    if (s == "VT")                                        { out = panjep::DistMethod::VT;      return true; }
+    if (s == "JTT")                                       { out = panjep::DistMethod::JTT;     return true; }
+    if (s == "WAG")                                       { out = panjep::DistMethod::WAG;     return true; }
+    if (s == "FLU")                                       { out = panjep::DistMethod::FLU;     return true; }
+    if (s == "F81" || s == "F81LIKE" || s == "F81-LIKE")  { out = panjep::DistMethod::F81;     return true; }
+    if (s == "HIVB")                                      { out = panjep::DistMethod::HIVb;    return true; }
+    if (s == "HIVW")                                      { out = panjep::DistMethod::HIVw;    return true; }
+    if (s == "CPREV")                                     { out = panjep::DistMethod::CpREV;   return true; }
+    if (s == "DCMUT")                                     { out = panjep::DistMethod::DCMut;   return true; }
+    if (s == "MTREV")                                     { out = panjep::DistMethod::MtREV;   return true; }
+    if (s == "RTREV")                                     { out = panjep::DistMethod::RtREV;   return true; }
+    if (s == "PDIST" || s == "P-DIST")                    { out = panjep::DistMethod::PDist;   return true; }
+    if (s == "DAYHOFF")                                   { out = panjep::DistMethod::Dayhoff; return true; }
+    return false;
 }
 
 static bool is_fasta(const std::string& path) {
@@ -75,22 +133,47 @@ int main(int argc, char** argv) {
         else if (arg == "-e" && i + 1 < argc) { n_ep        = std::atoi(argv[++i]); }
         else if (arg == "-d" && i + 1 < argc) {
             std::string m = argv[++i];
-            if      (m == "scoredist") dmethod = panjep::DistMethod::ScoreDist;
-            else if (m == "poisson")   dmethod = panjep::DistMethod::Poisson;
-            else if (m == "pdist")     dmethod = panjep::DistMethod::PDist;
-            else if (m == "jc69")      dmethod = panjep::DistMethod::JC69;
-            else if (m == "k2p")       dmethod = panjep::DistMethod::K2P;
-            else if (m == "f81")       dmethod = panjep::DistMethod::F81;
-            else if (m == "f84")       dmethod = panjep::DistMethod::F84;
-            else if (m == "tn93")      dmethod = panjep::DistMethod::TN93;
-            else if (m == "logdet")    dmethod = panjep::DistMethod::LogDet;
-            else if (m == "ry")        dmethod = panjep::DistMethod::RY;
-            else if (m == "rysym")     dmethod = panjep::DistMethod::RYSym;
-            else if (m == "auto")      dmethod = panjep::DistMethod::Auto;
+            std::string mlc = m;
+            std::transform(mlc.begin(), mlc.end(), mlc.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            if      (mlc == "scoredist") dmethod = panjep::DistMethod::ScoreDist;
+            else if (mlc == "poisson")   dmethod = panjep::DistMethod::Poisson;
+            else if (mlc == "pdist")     dmethod = panjep::DistMethod::PDist;
+            else if (mlc == "jc69")      dmethod = panjep::DistMethod::JC69;
+            else if (mlc == "k2p")       dmethod = panjep::DistMethod::K2P;
+            else if (mlc == "f81")       dmethod = panjep::DistMethod::F81;
+            else if (mlc == "f84")       dmethod = panjep::DistMethod::F84;
+            else if (mlc == "tn93")      dmethod = panjep::DistMethod::TN93;
+            else if (mlc == "logdet")    dmethod = panjep::DistMethod::LogDet;
+            else if (mlc == "ry")        dmethod = panjep::DistMethod::RY;
+            else if (mlc == "rysym")     dmethod = panjep::DistMethod::RYSym;
+            else if (mlc == "auto")      dmethod = panjep::DistMethod::Auto;
+            else if (mlc == "lg")        dmethod = panjep::DistMethod::LG;
+            else if (mlc == "wag")       dmethod = panjep::DistMethod::WAG;
+            else if (mlc == "jtt")       dmethod = panjep::DistMethod::JTT;
+            else if (mlc == "dayhoff")   dmethod = panjep::DistMethod::Dayhoff;
+            else if (mlc == "dcmut")     dmethod = panjep::DistMethod::DCMut;
+            else if (mlc == "mtrev")     dmethod = panjep::DistMethod::MtREV;
+            else if (mlc == "rtrev")     dmethod = panjep::DistMethod::RtREV;
+            else if (mlc == "cprev")     dmethod = panjep::DistMethod::CpREV;
+            else if (mlc == "vt")        dmethod = panjep::DistMethod::VT;
+            else if (mlc == "hivb")      dmethod = panjep::DistMethod::HIVb;
+            else if (mlc == "hivw")      dmethod = panjep::DistMethod::HIVw;
+            else if (mlc == "flu")       dmethod = panjep::DistMethod::FLU;
             else {
-                std::cerr << "Unknown distance method: " << m
-                          << " (expected scoredist | poisson | pdist | jc69 |"
-                             " k2p | f81 | f84 | tn93 | logdet | ry | rysym | auto)\n";
+                std::cerr << "Unknown distance method: " << m << "\n";
+                return 1;
+            }
+        }
+        else if (arg == "-p" && i + 1 < argc) {
+            // FastME-compatible protein-model selector.  -p LG, -p L, -p WAG, …
+            std::string m = argv[++i];
+            if (!parse_protein_model(m, dmethod)) {
+                std::cerr << "-p option: '" << m
+                          << "' invalid evolutionary model.\n"
+                          << "Expected one of: LG, WAG, JTT, Dayhoff, DCMut, "
+                             "MtREV, RtREV, CpREV, VT, HIVb, HIVw, FLU, "
+                             "F81, PDist (or single-letter aliases).\n";
                 return 1;
             }
         }

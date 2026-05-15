@@ -37,9 +37,18 @@ namespace panjep {
 // F81 / F84 / TN93 / RY are computed from the raw input sequences (residue
 // composition over the whole FASTA), and per-sequence frequencies for LogDet.
 // ---------------------------------------------------------------------------
+// Empirical AA exchange-rate models (Init_Qmat_* from FastME p_models.c):
+//   LG, WAG, JTT, Dayhoff, DCMut, MtREV, RtREV, CpREV, VT, HIVb, HIVw, FLU
+// For each pair, columns are counted into a 20×20 frequency matrix and the
+// ML branch length t is found by 1-D Brent optimisation against
+// P(t) = U·exp(Λt)·U⁻¹, with Λ,U coming from a one-shot symmetric
+// eigendecomposition of D^{½}·R·D^{½}/100 (R symmetric exchangeability).
+// Non-protein input silently falls back to Poisson(nc=4).
+// ---------------------------------------------------------------------------
 enum class DistMethod {
     Auto, ScoreDist, Poisson,
-    PDist, JC69, K2P, F81, F84, TN93, LogDet, RY, RYSym
+    PDist, JC69, K2P, F81, F84, TN93, LogDet, RY, RYSym,
+    LG, WAG, JTT, Dayhoff, DCMut, MtREV, RtREV, CpREV, VT, HIVb, HIVw, FLU
 };
 
 // ---------------------------------------------------------------------------

@@ -1336,6 +1336,308 @@ std::array<double, 20> aa_stationary(const std::vector<FastaSeq>& seqs) {
     return pi;
 }
 
+// ============================================================
+// Empirical AA exchange-rate models (FastME p_models.c).
+//   R[20][20] symmetric, π[20] stationary frequencies in the PAML ordering
+//   ARNDCQEGHILKMFPSTWYV (matches FastME's Assign_State).
+// ============================================================
+#include "aa_models_data.inc"
+
+// ASCII → PAML AA index (A=0, R=1, …, V=19).  B → N(2), Z → Q(5) like FastME.
+// Gap/X/J/U/O/*/lower-case → kAaInvalid so they drop out of column counts.
+static const std::array<int, 256> kAA_PAML = []() {
+    std::array<int, 256> t{};
+    for (auto& v : t) v = kAaInvalid;
+    const char* aa = "ARNDCQEGHILKMFPSTWYV";   // FastME order
+    for (int i = 0; aa[i]; ++i) {
+        t[static_cast<unsigned char>(aa[i])]        = i;
+        t[static_cast<unsigned char>(aa[i] | 0x20)] = i;
+    }
+    t['B'] = t['b'] = 2;   // ambiguous N/D → N
+    t['Z'] = t['z'] = 5;   // ambiguous Q/E → Q
+    return t;
+}();
+
+// Eigendecomposition of the rate matrix Q (built from R and π).  Q is
+// reversible, so we diagonalise the symmetric matrix S = D^{½}·Q·D^{-½}
+// = (D^{½}·R·D^{½})/(100·μ) − μ·I-style (in practice we just build the
+// 20×20 symmetric matrix and run Jacobi).  Then U = D^{-½}·V (right) and
+// U⁻¹ = Vᵀ·D^{½} (left); eigenvalues match.
+struct AaModel {
+    double pi[20];
+    double lam[20];
+    double U[20][20];     // right eigenvectors of Q (columns)
+    double Uinv[20][20];  // left eigenvectors (rows)
+};
+
+// Jacobi cyclic eigendecomposition for a symmetric n×n matrix in place.
+// A becomes diagonal (eigenvalues), V is orthogonal with the eigenvectors
+// as columns.  n is fixed to 20 here so the routine is small and fast.
+void jacobi_symmetric_20(double A[20][20], double V[20][20]) noexcept {
+    constexpr int N = 20;
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j) V[i][j] = (i == j) ? 1.0 : 0.0;
+
+    for (int sweep = 0; sweep < 100; ++sweep) {
+        double off = 0.0;
+        for (int p = 0; p < N - 1; ++p)
+            for (int q = p + 1; q < N; ++q) off += std::abs(A[p][q]);
+        if (off < 1e-14) return;
+
+        for (int p = 0; p < N - 1; ++p) {
+            for (int q = p + 1; q < N; ++q) {
+                const double apq = A[p][q];
+                if (std::abs(apq) < 1e-18) continue;
+                const double app = A[p][p];
+                const double aqq = A[q][q];
+                const double theta = (aqq - app) / (2.0 * apq);
+                double t;
+                if (std::abs(theta) > 1e18) t = 1.0 / (2.0 * theta);
+                else {
+                    t = (theta >= 0.0)
+                        ?  1.0 / ( theta + std::sqrt(1.0 + theta * theta))
+                        :  1.0 / ( theta - std::sqrt(1.0 + theta * theta));
+                }
+                const double c = 1.0 / std::sqrt(1.0 + t * t);
+                const double s = t * c;
+                A[p][p] = app - t * apq;
+                A[q][q] = aqq + t * apq;
+                A[p][q] = A[q][p] = 0.0;
+                for (int r = 0; r < N; ++r) {
+                    if (r != p && r != q) {
+                        const double arp = A[r][p];
+                        const double arq = A[r][q];
+                        A[r][p] = A[p][r] = c * arp - s * arq;
+                        A[r][q] = A[q][r] = s * arp + c * arq;
+                    }
+                    const double vrp = V[r][p];
+                    const double vrq = V[r][q];
+                    V[r][p] = c * vrp - s * vrq;
+                    V[r][q] = s * vrp + c * vrq;
+                }
+            }
+        }
+    }
+}
+
+AaModel build_aa_model(const double R[20][20], const double piIn[20]) {
+    AaModel M{};
+    for (int i = 0; i < 20; ++i) M.pi[i] = piIn[i];
+
+    // Q_ij = R_ij · π_j / 100 (i≠j); Q_ii = −Σ_{j≠i} Q_ij.
+    double Q[20][20] = {};
+    for (int i = 0; i < 20; ++i) {
+        double rowsum = 0.0;
+        for (int j = 0; j < 20; ++j) if (j != i) {
+            Q[i][j] = R[i][j] * M.pi[j] / 100.0;
+            rowsum += Q[i][j];
+        }
+        Q[i][i] = -rowsum;
+    }
+    // Scale by mean rate μ = Σ_i π_i · (−Q_ii) so the model mutates at rate 1.
+    double mu = 0.0;
+    for (int i = 0; i < 20; ++i) mu += M.pi[i] * (-Q[i][i]);
+    if (mu > 0.0) {
+        for (int i = 0; i < 20; ++i)
+            for (int j = 0; j < 20; ++j) Q[i][j] /= mu;
+    }
+
+    // Symmetrise: S = D^{½}·Q·D^{-½}, with D = diag(π).  For reversible Q
+    // (which all empirical AA models satisfy by construction) S is real
+    // symmetric, so Jacobi gives real eigenvalues.
+    double sqp[20], invsqp[20];
+    for (int i = 0; i < 20; ++i) {
+        sqp[i]    = std::sqrt(M.pi[i]);
+        invsqp[i] = (M.pi[i] > 0.0) ? 1.0 / sqp[i] : 0.0;
+    }
+    double S[20][20];
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j)
+            S[i][j] = sqp[i] * Q[i][j] * invsqp[j];
+    // Force exact symmetry to avoid Jacobi drift from FP rounding.
+    for (int i = 0; i < 20; ++i)
+        for (int j = i + 1; j < 20; ++j) {
+            const double v = 0.5 * (S[i][j] + S[j][i]);
+            S[i][j] = S[j][i] = v;
+        }
+
+    double V[20][20];
+    jacobi_symmetric_20(S, V);
+    for (int i = 0; i < 20; ++i) M.lam[i] = S[i][i];
+
+    // U = D^{-½}·V (columns are right eigvecs of Q); U⁻¹ = Vᵀ·D^{½}.
+    for (int i = 0; i < 20; ++i)
+        for (int k = 0; k < 20; ++k) {
+            M.U   [i][k] = invsqp[i] * V[i][k];
+            M.Uinv[k][i] = V[i][k] * sqp[i];
+        }
+    return M;
+}
+
+// P(t)_ij = Σ_k U_ik · exp(λ_k·t) · Uinv_kj.
+void aa_pmat(double t, const AaModel& M, double P[20][20]) noexcept {
+    double expt[20];
+    for (int k = 0; k < 20; ++k) expt[k] = std::exp(M.lam[k] * t);
+    double UE[20][20];
+    for (int i = 0; i < 20; ++i)
+        for (int k = 0; k < 20; ++k) UE[i][k] = M.U[i][k] * expt[k];
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j) {
+            double s = 0.0;
+            for (int k = 0; k < 20; ++k) s += UE[i][k] * M.Uinv[k][j];
+            // Numerical safety: clip tiny negatives from finite-precision
+            // eigen residuals, matching FastME's DBL_MIN clamp.
+            P[i][j] = s > 1e-300 ? s : 1e-300;
+        }
+}
+
+// Negative log-likelihood at branch length t given column-pair counts F[20][20]
+// normalised so ΣF = 1.  Mirrors FastME's Lk_Dist + partialLK with n_catg = 1.
+double aa_neg_lnL(double t, const double F[20][20], const AaModel& M) noexcept {
+    double P[20][20];
+    aa_pmat(t, M, P);
+    double lnL = 0.0;
+    for (int i = 0; i < 20; ++i) {
+        const double pi_i = M.pi[i];
+        if (pi_i <= 0.0) continue;
+        for (int j = 0; j < 20; ++j) {
+            if (F[i][j] <= 0.0) continue;
+            lnL += F[i][j] * std::log(pi_i * P[i][j]);
+        }
+    }
+    return -lnL;
+}
+
+// Brent 1-D minimisation, ported from FastME Dist_F_Brent.  Tolerances and
+// constants mirror Numerical Recipes; the small max_iter cap (≈60) is more
+// than enough for our 1-D smooth surface.
+constexpr double kBL_MIN = 1.0e-8;
+constexpr double kBL_MAX = 100.0;
+
+double brent_min_1d(double ax, double bx, double cx,
+                    const double F[20][20], const AaModel& M,
+                    double tol = 1.0e-6, int max_iter = 60) noexcept {
+    constexpr double CGOLD = 0.3819660;
+    constexpr double ZEPS  = 1.0e-12;
+    double a = std::min(ax, cx), b = std::max(ax, cx);
+    double x = bx, w = bx, v = bx;
+    double fx = aa_neg_lnL(std::abs(x), F, M);
+    double fw = fx, fv = fx;
+    double d = 0.0, e = 0.0;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        const double xm   = 0.5 * (a + b);
+        const double tol1 = tol * std::abs(x) + ZEPS;
+        const double tol2 = 2.0 * tol1;
+        if (std::abs(x - xm) <= (tol2 - 0.5 * (b - a))) return x;
+
+        double u;
+        if (std::abs(e) > tol1) {
+            const double r = (x - w) * (fx - fv);
+            double q       = (x - v) * (fx - fw);
+            double p       = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+            if (q > 0.0) p = -p;
+            q = std::abs(q);
+            const double etemp = e;
+            e = d;
+            if (std::abs(p) >= std::abs(0.5 * q * etemp) ||
+                p <= q * (a - x) || p >= q * (b - x)) {
+                e = (x >= xm) ? a - x : b - x;
+                d = CGOLD * e;
+            } else {
+                d = p / q;
+                u = x + d;
+                if (u - a < tol2 || b - u < tol2)
+                    d = std::copysign(tol1, xm - x);
+            }
+        } else {
+            e = (x >= xm) ? a - x : b - x;
+            d = CGOLD * e;
+        }
+        u = (std::abs(d) >= tol1) ? (x + d) : (x + std::copysign(tol1, d));
+        if (u < kBL_MIN) u = kBL_MIN;
+        const double fu = aa_neg_lnL(std::abs(u), F, M);
+        if (fu <= fx) {
+            if (u >= x) a = x; else b = x;
+            v = w; w = x; x = u;
+            fv = fw; fw = fx; fx = fu;
+        } else {
+            if (u < x) a = u; else b = u;
+            if (fu <= fw || w == x) {
+                v = w; w = u; fv = fw; fw = fu;
+            } else if (fu <= fv || v == x || v == w) {
+                v = u; fv = fu;
+            }
+        }
+    }
+    return x;
+}
+
+// Per-pair ML distance under an empirical AA model.  Walks the qaln/taln
+// columns, fills a (raw) 20×20 count matrix, normalises and hands it to
+// Brent.  Initial bracket follows FastME (ax=BL_MIN, cx=BL_MAX, bx = JC-style
+// guess clamped to [BL_MIN, 5]).
+double aa_model_dist(const std::string& A, const std::string& B,
+                     const AaModel& M) {
+    const std::size_t L = std::min(A.size(), B.size());
+    double F[20][20] = {};
+    long long total = 0, mism = 0;
+    for (std::size_t p = 0; p < L; ++p) {
+        const int pa = kAA_PAML[(unsigned char)A[p]];
+        const int pb = kAA_PAML[(unsigned char)B[p]];
+        if (pa < 0 || pb < 0) continue;
+        F[pa][pb] += 1.0;
+        ++total;
+        if (pa != pb) ++mism;
+    }
+    if (total == 0) return kMaxDist;
+    const double inv = 1.0 / static_cast<double>(total);
+    for (int i = 0; i < 20; ++i)
+        for (int j = 0; j < 20; ++j) F[i][j] *= inv;
+
+    // JC-like initial guess (0.95 is the Poisson(20) saturation cap).
+    const double b = static_cast<double>(mism) / static_cast<double>(total);
+    double init = 0.1;
+    const double y = 1.0 - b / 0.95;
+    if (y > 1e-8) {
+        const double d0 = -0.95 * std::log(y);
+        if (d0 > kBL_MIN && d0 < kMaxDist) init = d0;
+    }
+    if (init < kBL_MIN) init = kBL_MIN;
+    if (init > kMaxDist) init = kMaxDist;
+
+    const double d = brent_min_1d(kBL_MIN, init, kBL_MAX, F, M);
+    if (!(d > 0.0)) return kBL_MIN;
+    return d > kMaxDist ? kMaxDist : d;
+}
+
+// Look up the R/π table for a given DistMethod.  Returns nullptr/nullptr for
+// non-empirical-AA methods.
+bool aa_model_tables(DistMethod m,
+                     const double (**Rout)[20], const double** piOut) {
+    switch (m) {
+        case DistMethod::LG:      *Rout = kR_LG;      *piOut = kPi_LG;      return true;
+        case DistMethod::WAG:     *Rout = kR_WAG;     *piOut = kPi_WAG;     return true;
+        case DistMethod::JTT:     *Rout = kR_JTT;     *piOut = kPi_JTT;     return true;
+        case DistMethod::Dayhoff: *Rout = kR_Dayhoff; *piOut = kPi_Dayhoff; return true;
+        case DistMethod::DCMut:   *Rout = kR_DCMut;   *piOut = kPi_DCMut;   return true;
+        case DistMethod::MtREV:   *Rout = kR_MtREV;   *piOut = kPi_MtREV;   return true;
+        case DistMethod::RtREV:   *Rout = kR_RtREV;   *piOut = kPi_RtREV;   return true;
+        case DistMethod::CpREV:   *Rout = kR_CpREV;   *piOut = kPi_CpREV;   return true;
+        case DistMethod::VT:      *Rout = kR_VT;      *piOut = kPi_VT;      return true;
+        case DistMethod::HIVb:    *Rout = kR_HIVb;    *piOut = kPi_HIVb;    return true;
+        case DistMethod::HIVw:    *Rout = kR_HIVw;    *piOut = kPi_HIVw;    return true;
+        case DistMethod::FLU:     *Rout = kR_FLU;     *piOut = kPi_FLU;     return true;
+        default: return false;
+    }
+}
+
+bool is_aa_model(DistMethod m) {
+    const double (*R)[20] = nullptr; const double* p = nullptr;
+    return aa_model_tables(m, &R, &p);
+}
+
 // ---- DistContext: precomputed model-specific constants -----------------------
 
 struct DistContext {
@@ -1351,6 +1653,8 @@ struct DistContext {
     double tn_PAPG = 0.0, tn_PCPT = 0.0;
     // LogDet: per-sequence (1/8)·Σ log π_i (kInvalid = −INF if any π_i = 0).
     std::vector<double> per_seq_log_pi_sum;
+    // Empirical AA model: eigendecomposition of Q, built once on -p selection.
+    std::unique_ptr<AaModel> aa_model;
 };
 
 DistContext build_dist_context(DistMethod m, bool nucl,
@@ -1395,6 +1699,12 @@ DistContext build_dist_context(DistMethod m, bool nucl,
     if (nucl && m == DistMethod::LogDet)
         c.per_seq_log_pi_sum = dna_log_pi_sum_per_seq(seqs);
 
+    if (!nucl && is_aa_model(m)) {
+        const double (*R)[20] = nullptr; const double* pi = nullptr;
+        aa_model_tables(m, &R, &pi);
+        c.aa_model = std::make_unique<AaModel>(build_aa_model(R, pi));
+    }
+
     return c;
 }
 
@@ -1431,6 +1741,13 @@ double pair_distance(const std::string& A, const std::string& B,
         const auto h = hamming(A, B, nucl ? kN2P : kAA20);
         if (h.numS == 0) return kMaxDist;
         return calc_f81(nucl ? c.f81_loc_dna : c.f81_loc_aa, h.b);
+    }
+
+    // -- Empirical AA models: ML branch length under Q from R/π ---------------
+    if (is_aa_model(m)) {
+        if (nucl) return poisson_dist(A, B, 4);   // not meaningful for DNA
+        if (!c.aa_model) return poisson_dist(A, B, 20);
+        return aa_model_dist(A, B, *c.aa_model);
     }
 
     // -- DNA-only paths needing the 4×4 P matrix --------------------------------
@@ -1518,6 +1835,18 @@ FastaData load_fasta_distance(const std::string& path, int threads,
             case DistMethod::LogDet:    return "LogDet";
             case DistMethod::RY:        return "RY (transversion)";
             case DistMethod::RYSym:     return "RY-symmetric";
+            case DistMethod::LG:        return "LG (ML)";
+            case DistMethod::WAG:       return "WAG (ML)";
+            case DistMethod::JTT:       return "JTT (ML)";
+            case DistMethod::Dayhoff:   return "Dayhoff (ML)";
+            case DistMethod::DCMut:     return "DCMut (ML)";
+            case DistMethod::MtREV:     return "MtREV (ML)";
+            case DistMethod::RtREV:     return "RtREV (ML)";
+            case DistMethod::CpREV:     return "CpREV (ML)";
+            case DistMethod::VT:        return "VT (ML)";
+            case DistMethod::HIVb:      return "HIVb (ML)";
+            case DistMethod::HIVw:      return "HIVw (ML)";
+            case DistMethod::FLU:       return "FLU (ML)";
             default:                    return "?";
         }
     };
